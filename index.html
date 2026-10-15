@@ -79,6 +79,9 @@
   .eq span:nth-child(4) { height: 80%; animation-delay: .1s; }
   @keyframes eq { 0%,100% { transform: scaleY(.4); } 50% { transform: scaleY(1); } }
   .tip { position: relative; z-index: 1; text-align: center; color: #8b95c2; font-size: 12.5px; padding: 6px 30px 0; max-width: 560px; margin: 0 auto; }
+  .card.loading { animation: cardpulse 1s ease-in-out infinite; }
+  @keyframes cardpulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
+  .credit { position: relative; z-index: 1; text-align: center; color: #5b648f; font-size: 11px; padding: 14px 30px 0; max-width: 560px; margin: 0 auto; }
   .dock {
     position: fixed; left: 0; right: 0; bottom: 0; z-index: 2;
     background: rgba(10, 14, 34, .72);
@@ -126,6 +129,7 @@
 <main>
   <div class="grid" id="grid"></div>
   <p class="tip">Tip: layer a few together &mdash; rain + fireplace is elite. Set a timer and drift off.</p>
+  <p class="credit">Rain recordings via Wikimedia Commons contributors (CC BY-SA)</p>
 </main>
 
 <div class="dock" id="dock">
@@ -149,10 +153,10 @@
 
 <script>
 "use strict";
-/* ============ Drift · procedural sleep sounds ============
-   Every sound is synthesized live with the Web Audio API —
-   filtered noise, scheduled thunder, crackles, chirps.
-   No audio files: the loops are seamless and endless. */
+/* ============ Drift · sleep sounds ============
+   Rain beds are real HD recordings (Wikimedia Commons), looped
+   seamlessly with a baked-in crossfade. Everything else is
+   synthesized live with the Web Audio API. */
 
 const SOUNDS = [
   { id:"rain",     emoji:"\u{1F327}", name:"Gentle Rain",    desc:"soft rainfall" },
@@ -168,8 +172,59 @@ const SOUNDS = [
 
 let AC = null, master = null;
 const active = new Map();           // id -> handle
+const pendingLoads = new Map();     // id -> { cancelled }
 const bufCache = {};
 const state = { masterVol: 0.8, vols: {}, timerMin: 0 };
+
+/* ---------- recorded rain files (HD, seamless crossfade loops) ---------- */
+const FILE_URLS = {
+  rain: "sounds/rain-gentle.mp3",
+  tinroof: "sounds/rain-tinroof.mp3",
+};
+const fileBufCache = {};
+function preloadRainFiles() {
+  if (!AC) return;
+  Object.values(FILE_URLS).forEach(u => loadFileBuf(u).catch(() => {}));
+}
+async function loadFileBuf(url) {
+  if (fileBufCache[url]) return fileBufCache[url];
+  const p = (async () => {
+    const res = await fetch(url, { cache: "force-cache" });
+    if (!res.ok) throw new Error("http " + res.status);
+    return AC.decodeAudioData(await res.arrayBuffer());
+  })();
+  fileBufCache[url] = p;
+  try { return await p; }
+  catch (e) { delete fileBufCache[url]; throw e; }
+}
+/* Bake a crossfade of the tail into the head so buffer.loop is seamless
+   with zero timers (immune to mobile background throttling). */
+function xfadeLoopBuffer(buf, xfadeSecs) {
+  const sr = buf.sampleRate;
+  const xlen = Math.min(Math.floor(sr * xfadeSecs), Math.floor(buf.length / 4));
+  const out = AC.createBuffer(buf.numberOfChannels, buf.length, sr);
+  for (let ch = 0; ch < buf.numberOfChannels; ch++) {
+    const src = buf.getChannelData(ch), dst = out.getChannelData(ch);
+    dst.set(src);
+    const start = buf.length - xlen;
+    for (let i = 0; i < xlen; i++) {
+      const t = i / xlen;
+      dst[start + i] = src[start + i] * (1 - t) + src[i] * t;
+    }
+  }
+  return out;
+}
+async function fileLoop(h, url, level) {
+  const buf = await loadFileBuf(url);
+  if (h.dead) return;
+  const src = AC.createBufferSource();
+  src.buffer = xfadeLoopBuffer(buf, 4);
+  src.loop = true;
+  const g = AC.createGain(); g.gain.value = level;
+  src.connect(g); g.connect(h.out);
+  src.start();
+  h.nodes.push(src);
+}
 
 /* ---------- audio helpers ---------- */
 function ensureCtx() {
@@ -189,6 +244,7 @@ function ensureCtx() {
     }
   }
   if (AC.state === "suspended") AC.resume();
+  preloadRainFiles();
 }
 
 function noiseBuf(type, secs) {
@@ -312,11 +368,44 @@ function thunderClap(h) {
   }, (0.3 + dist * 2.2) * 1000));
 }
 
-const BUILDERS = {
-  rain(h) { rainBed(h, 0.5, true); },
+/* legacy procedural tin roof — fallback if the recording can't load */
+function tinroofLegacy(h) {
+  const src = loopSrc("white", 8); h.nodes.push(src);
+  const hp = filt("highpass", 1100), bp = filt("bandpass", 3600, 0.9);
+  const g = AC.createGain(); g.gain.value = 0.4;
+  src.connect(hp); hp.connect(bp); bp.connect(g); g.connect(h.out);
+  const l = lfo(0.8, 0.12); l.out.connect(g.gain); h.nodes.push(l.osc);
+  src.start();
+  repeat(h, () => {  // metallic pings
+    const o = AC.createOscillator(); o.type = "triangle";
+    o.frequency.value = 1700 + Math.random() * 3800;
+    const e = AC.createGain(); const t = AC.currentTime;
+    const v = 0.015 + Math.random() * 0.05, dur = 0.1 + Math.random() * 0.18;
+    e.gain.setValueAtTime(v, t);
+    e.gain.exponentialRampToValueAtTime(0.0008, t + dur);
+    o.connect(e); e.connect(h.out); o.start(t); o.stop(t + dur + 0.05); h.blip(o);
+  }, 140, 650);
+  repeat(h, () => {  // low resonant patter
+    const o = AC.createOscillator(); o.type = "sine";
+    o.frequency.value = 380 + Math.random() * 320;
+    const e = AC.createGain(); const t = AC.currentTime;
+    const v = 0.02 + Math.random() * 0.04;
+    e.gain.setValueAtTime(v, t);
+    e.gain.exponentialRampToValueAtTime(0.0008, t + 0.4);
+    o.connect(e); e.connect(h.out); o.start(t); o.stop(t + 0.5); h.blip(o);
+  }, 1200, 4000);
+}
 
-  storm(h) {
-    rainBed(h, 0.34, true);
+const BUILDERS = {
+  async rain(h) {
+    try { await fileLoop(h, FILE_URLS.rain, 1.0); }
+    catch (e) { if (!h.dead) rainBed(h, 0.5, true); }
+  },
+
+  async storm(h) {
+    try { await fileLoop(h, FILE_URLS.rain, 0.85); }
+    catch (e) { if (!h.dead) rainBed(h, 0.34, true); }
+    if (h.dead) return;
     const w = loopSrc("brown", 8); h.nodes.push(w);
     const wlp = filt("lowpass", 240);
     const wg = AC.createGain(); wg.gain.value = 0.32;
@@ -327,31 +416,9 @@ const BUILDERS = {
     repeat(h, () => thunderClap(h), 9000, 32000);
   },
 
-  tinroof(h) {
-    const src = loopSrc("white", 8); h.nodes.push(src);
-    const hp = filt("highpass", 1100), bp = filt("bandpass", 3600, 0.9);
-    const g = AC.createGain(); g.gain.value = 0.4;
-    src.connect(hp); hp.connect(bp); bp.connect(g); g.connect(h.out);
-    const l = lfo(0.8, 0.12); l.out.connect(g.gain); h.nodes.push(l.osc);
-    src.start();
-    repeat(h, () => {  // metallic pings
-      const o = AC.createOscillator(); o.type = "triangle";
-      o.frequency.value = 1700 + Math.random() * 3800;
-      const e = AC.createGain(); const t = AC.currentTime;
-      const v = 0.015 + Math.random() * 0.05, dur = 0.1 + Math.random() * 0.18;
-      e.gain.setValueAtTime(v, t);
-      e.gain.exponentialRampToValueAtTime(0.0008, t + dur);
-      o.connect(e); e.connect(h.out); o.start(t); o.stop(t + dur + 0.05); h.blip(o);
-    }, 140, 650);
-    repeat(h, () => {  // low resonant patter
-      const o = AC.createOscillator(); o.type = "sine";
-      o.frequency.value = 380 + Math.random() * 320;
-      const e = AC.createGain(); const t = AC.currentTime;
-      const v = 0.02 + Math.random() * 0.04;
-      e.gain.setValueAtTime(v, t);
-      e.gain.exponentialRampToValueAtTime(0.0008, t + 0.4);
-      o.connect(e); e.connect(h.out); o.start(t); o.stop(t + 0.5); h.blip(o);
-    }, 1200, 4000);
+  async tinroof(h) {
+    try { await fileLoop(h, FILE_URLS.tinroof, 0.9); }
+    catch (e) { if (!h.dead) tinroofLegacy(h); }
   },
 
   ocean(h) {
@@ -452,20 +519,31 @@ const BUILDERS = {
 };
 
 /* ---------- transport ---------- */
-function toggleSound(id) {
+async function toggleSound(id) {
   ensureCtx();
   const h = active.get(id);
-  if (h) { h.stop(); active.delete(id); }
-  else {
-    const nh = baseHandle();
-    BUILDERS[id](nh);
-    nh.setVol(state.vols[id] !== undefined ? state.vols[id] : 0.8);
-    active.set(id, nh);
+  if (h) { h.stop(); active.delete(id); render(); return; }
+  if (pendingLoads.has(id)) {           // tapped while loading: cancel it
+    pendingLoads.get(id).cancelled = true;
+    pendingLoads.delete(id);
+    render();
+    return;
   }
+  const load = { cancelled: false };
+  pendingLoads.set(id, load);
+  render();
+  const nh = baseHandle();
+  try { await BUILDERS[id](nh); } catch (e) {}
+  pendingLoads.delete(id);
+  if (load.cancelled || nh.dead) { nh.stop(); render(); return; }
+  nh.setVol(state.vols[id] !== undefined ? state.vols[id] : 0.8);
+  active.set(id, nh);
   render();
 }
 
 function stopAll() {
+  pendingLoads.forEach(l => { l.cancelled = true; });
+  pendingLoads.clear();
   active.forEach(h => h.stop());
   active.clear();
   clearTimeout(timerId); clearInterval(timerInt);
@@ -536,7 +614,9 @@ stopAllBtn.addEventListener("click", stopAll);
 
 function render() {
   SOUNDS.forEach(s => {
-    document.getElementById("card-" + s.id).classList.toggle("playing", active.has(s.id));
+    const card = document.getElementById("card-" + s.id);
+    card.classList.toggle("playing", active.has(s.id));
+    card.classList.toggle("loading", pendingLoads.has(s.id));
   });
   stopAllBtn.classList.toggle("hidden", active.size === 0);
   mixer.innerHTML = "";
