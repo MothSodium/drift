@@ -129,7 +129,7 @@
 <main>
   <div class="grid" id="grid"></div>
   <p class="tip">Tip: layer a few together &mdash; rain + fireplace is elite. Set a timer and drift off.</p>
-  <p class="credit">Rain recordings via Wikimedia Commons contributors (CC BY-SA)</p>
+  <p class="credit">Field recordings via Wikimedia Commons contributors (CC BY / CC BY-SA)</p>
 </main>
 
 <div class="dock" id="dock">
@@ -180,7 +180,40 @@ const state = { masterVol: 0.8, vols: {}, timerMin: 0 };
 const FILE_URLS = {
   rain: "sounds/rain-gentle.mp3",
   tinroof: "sounds/rain-tinroof.mp3",
+  fire: "sounds/fire-bonfire.mp3",
 };
+const THUNDER_URLS = [
+  "sounds/thunder-1.mp3",
+  "sounds/thunder-2.mp3",
+  "sounds/thunder-3.mp3",
+  "sounds/thunder-4.mp3",
+];
+function preloadThunder() {
+  if (!AC) return;
+  THUNDER_URLS.forEach(u => loadFileBuf(u).catch(() => {}));
+}
+/* Real recorded thunder: random clap, random distance feel + stereo position */
+async function thunderClapReal(h) {
+  const url = THUNDER_URLS[(Math.random() * THUNDER_URLS.length) | 0];
+  try {
+    const buf = await loadFileBuf(url);
+    if (h.dead) return;
+    const src = AC.createBufferSource(); src.buffer = buf;
+    const g = AC.createGain();
+    g.gain.value = 0.45 + Math.random() * 0.55;
+    src.connect(g);
+    let tail = g;
+    if (AC.createStereoPanner) {
+      const pan = AC.createStereoPanner();
+      pan.pan.value = Math.random() * 1.6 - 0.8;
+      g.connect(pan); tail = pan;
+    }
+    tail.connect(h.out);
+    const t = AC.currentTime + 0.05;
+    src.start(t); src.stop(t + buf.duration + 0.1);
+    h.blip(src);
+  } catch (e) { if (!h.dead) thunderClap(h); }
+}
 const fileBufCache = {};
 function preloadRainFiles() {
   if (!AC) return;
@@ -245,6 +278,7 @@ function ensureCtx() {
   }
   if (AC.state === "suspended") AC.resume();
   preloadRainFiles();
+  preloadThunder();
 }
 
 function noiseBuf(type, secs) {
@@ -396,6 +430,37 @@ function tinroofLegacy(h) {
   }, 1200, 4000);
 }
 
+/* legacy procedural fire — fallback if the recording can't load */
+function fireLegacy(h) {
+  const src = loopSrc("brown", 8); h.nodes.push(src);
+  const lp = filt("lowpass", 220);
+  const g = AC.createGain(); g.gain.value = 0.5;
+  src.connect(lp); lp.connect(g); g.connect(h.out);
+  const l = lfo(0.11, 0.08); l.out.connect(g.gain); h.nodes.push(l.osc);
+  src.start();
+  repeat(h, () => {  // crackles
+    if (Math.random() < 0.1) {  // occasional deep pop
+      const o = AC.createOscillator(); o.type = "sine";
+      o.frequency.value = 150 + Math.random() * 150;
+      const e = AC.createGain(); const t = AC.currentTime;
+      const v = 0.06 + Math.random() * 0.08;
+      e.gain.setValueAtTime(v, t);
+      e.gain.exponentialRampToValueAtTime(0.0008, t + 0.12);
+      o.connect(e); e.connect(h.out); o.start(t); o.stop(t + 0.2); h.blip(o);
+      return;
+    }
+    const p = AC.createBufferSource(); p.buffer = noiseBuf("white", 0.08);
+    const bp = filt("bandpass", 1300 + Math.random() * 2400, 7);
+    const e = AC.createGain(); const t = AC.currentTime;
+    const v = 0.03 + Math.random() * 0.13;
+    e.gain.setValueAtTime(0.0001, t);
+    e.gain.exponentialRampToValueAtTime(v, t + 0.005);
+    e.gain.exponentialRampToValueAtTime(0.0008, t + 0.03 + Math.random() * 0.06);
+    p.connect(bp); bp.connect(e); e.connect(h.out);
+    p.start(t); p.stop(t + 0.15); h.blip(p);
+  }, 60, 700);
+}
+
 const BUILDERS = {
   async rain(h) {
     try { await fileLoop(h, FILE_URLS.rain, 1.0); }
@@ -412,8 +477,8 @@ const BUILDERS = {
     w.connect(wlp); wlp.connect(wg); wg.connect(h.out);
     const l = lfo(0.08, 0.2); l.out.connect(wg.gain); h.nodes.push(l.osc);
     w.start();
-    h.timers.push(setTimeout(() => { if (!h.dead) thunderClap(h); }, 2500));
-    repeat(h, () => thunderClap(h), 9000, 32000);
+    h.timers.push(setTimeout(() => { if (!h.dead) thunderClapReal(h); }, 2500));
+    repeat(h, () => thunderClapReal(h), 9000, 32000);
   },
 
   async tinroof(h) {
@@ -458,34 +523,9 @@ const BUILDERS = {
     src.start();
   },
 
-  fire(h) {
-    const src = loopSrc("brown", 8); h.nodes.push(src);
-    const lp = filt("lowpass", 220);
-    const g = AC.createGain(); g.gain.value = 0.5;
-    src.connect(lp); lp.connect(g); g.connect(h.out);
-    const l = lfo(0.11, 0.08); l.out.connect(g.gain); h.nodes.push(l.osc);
-    src.start();
-    repeat(h, () => {  // crackles
-      if (Math.random() < 0.1) {  // occasional deep pop
-        const o = AC.createOscillator(); o.type = "sine";
-        o.frequency.value = 150 + Math.random() * 150;
-        const e = AC.createGain(); const t = AC.currentTime;
-        const v = 0.06 + Math.random() * 0.08;
-        e.gain.setValueAtTime(v, t);
-        e.gain.exponentialRampToValueAtTime(0.0008, t + 0.12);
-        o.connect(e); e.connect(h.out); o.start(t); o.stop(t + 0.2); h.blip(o);
-        return;
-      }
-      const p = AC.createBufferSource(); p.buffer = noiseBuf("white", 0.08);
-      const bp = filt("bandpass", 1300 + Math.random() * 2400, 7);
-      const e = AC.createGain(); const t = AC.currentTime;
-      const v = 0.03 + Math.random() * 0.13;
-      e.gain.setValueAtTime(0.0001, t);
-      e.gain.exponentialRampToValueAtTime(v, t + 0.005);
-      e.gain.exponentialRampToValueAtTime(0.0008, t + 0.03 + Math.random() * 0.06);
-      p.connect(bp); bp.connect(e); e.connect(h.out);
-      p.start(t); p.stop(t + 0.15); h.blip(p);
-    }, 60, 700);
+  async fire(h) {
+    try { await fileLoop(h, FILE_URLS.fire, 0.9); }
+    catch (e) { if (!h.dead) fireLegacy(h); }
   },
 
   crickets(h) {
